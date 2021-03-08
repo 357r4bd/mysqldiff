@@ -57,6 +57,7 @@ sub new {
     bless $self, ref $class || $class;
 
     $self->{opts} = \%hash;
+    $self->{tmp_indices} = [];
 
     if($hash{debug})        { debug_level($hash{debug})     ; delete $hash{debug};      }
     if($hash{debug_file})   { debug_file($hash{debug_file}) ; delete $hash{debug_file}; }
@@ -196,6 +197,7 @@ sub _diff_tables {
         $self->_diff_indices(@_),
         $self->_diff_primary_key(@_),
         $self->_diff_foreign_key_add(@_),
+        $self->_remove_tmp_indices(@_),
         $self->_diff_options(@_)        
     );
 
@@ -234,10 +236,16 @@ sub _diff_fields {
                     {
                         debug(3,"field '$field' changed");
 
-                        my $change = "ALTER TABLE $name1 CHANGE COLUMN $field $field $f2;";
-                        $change .= " # was $f1" unless $self->{opts}{'no-old-defs'};
-                        $change .= "\n";
-                        push @changes, $change;
+                        if($table2->field($field) =~ /auto_increment/i) {
+                            push @changes, "# $field (altered below) was $f1\n" unless $self->{opts}{'no-old-defs'};
+                            push @changes, $self->_alter_auto_col($table2, $field);
+                        }
+                        else {
+                            my $change = "ALTER TABLE $name1 CHANGE COLUMN $field $field $f2;\n";
+                            $change .= " # was $f1" unless $self->{opts}{'no-old-defs'};
+                            $change .= "\n";
+                            push @changes, $change;
+                        }
                     }
                 }
             } elsif (!$self->{opts}{'keep-old-columns'}) {
@@ -254,13 +262,11 @@ sub _diff_fields {
         for my $field (keys %$fields2) {
             unless($fields1 && $fields1->{$field}) {
                 debug(3,"field '$field' added");
-                my $changes = "ALTER TABLE $name1 ADD COLUMN $field $fields2->{$field}";
-                if ($table2->is_auto_inc($field)) {
-                    if ($table2->isa_primary($field)) {
-                        $changes .= ' PRIMARY KEY';
-                    } elsif ($table2->is_unique($field)) {
-                        $changes .= ' UNIQUE KEY';
-                    }
+                if($table2->field($field) =~ /auto_increment/i) {
+                    push @changes, $self->_alter_auto_col($table2, $field, 1);
+                }
+                else {
+                    push @changes, "ALTER TABLE $name1 ADD COLUMN $field $fields2->{$field};\n";
                 }
                 push @changes, "$changes;\n";
             }
@@ -446,6 +452,51 @@ sub _diff_foreign_key_add {
             push @changes, "ALTER TABLE $name1 ADD CONSTRAINT $fk FOREIGN KEY $fks2->{$fk};\n";
         }
     }
+
+    return @changes;
+}
+
+sub _remove_tmp_indices {
+    my ($self, $table1, $table2) = @_;
+
+    my @changes;
+    for my $tmp_index (@{$self->{tmp_indices}}) {
+        my $table_name = $table1->name;
+        push @changes, "DROP INDEX $tmp_index ON $table_name;\n";
+    }
+
+    $self->{tmp_indices} = [];
+
+    return @changes;
+}
+
+# AUTO_INCREMENT fields need to have an index. Since indices and primary keys are
+# added in separate statements in later steps, we must handle such fields a little
+# differently than normal.
+#
+# We first add/change the column without the AUTO_INCREMENT attribute, then add a
+# temporary index, and finally alter the column to include the AUTO_INCREMENT
+# attribute. Later, once the actual index and key diffs from table2 have been applied,
+# _diff_tables will safely remove the temporary index created via _remove_tmp_indices.
+sub _alter_auto_col {
+    my ($self, $table2, $field, $is_new) = @_;
+
+    my @changes;
+    my $table_name = $table2->name();
+    my $field_def = $table2->field($field);
+    (my $field_def_no_auto = $field_def) =~ s/\s*auto_increment(=\d+)?//i;
+    my $tmp_index = "tmp_${table_name}_on_$field";
+
+    push @{$self->{tmp_indices}}, $tmp_index;
+    if($is_new) {
+        push @changes, "ALTER TABLE $table_name ADD COLUMN $field $field_def_no_auto;\n";
+    }
+    else {
+        # This is not necessary in all cases, but ensures types match before getting started
+        push @changes, "ALTER TABLE $table_name CHANGE COLUMN $field $field $field_def_no_auto;\n";
+    }
+    push @changes, "CREATE INDEX $tmp_index on $table_name ($field);\n";
+    push @changes, "ALTER TABLE $table_name CHANGE COLUMN $field $field $field_def;\n";
 
     return @changes;
 }
